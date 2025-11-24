@@ -50,7 +50,7 @@ jobs:
             ./out/ai-gateway-helm-${TAG}.tgz \
             ./out/aigw-*
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
 
       - name: Create a stable release
         if: ${{ !contains(github.ref, '-rc') }}
@@ -60,4 +60,4 @@ jobs:
             ./out/ai-gateway-helm-${TAG}.tgz \
             ./out/aigw-*
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
