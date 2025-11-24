@@ -22,7 +22,7 @@ GO_LDFLAGS += -X $(VERSION_PACKAGE).version=$(VERSION_STRING)
 OUTPUT_DIR ?= out
 
 # Arguments for docker builds.
-OCI_REGISTRY ?= docker.io/envoyproxy
+OCI_REGISTRY ?= docker.io/sqaisarpype
 OCI_REPOSITORY_PREFIX ?= ${OCI_REGISTRY}/ai-gateway
 TAG ?= latest
 ENABLE_MULTI_PLATFORMS ?= false
@@ -360,8 +360,8 @@ helm-test: HELM_CHART_PATH = $(OUTPUT_DIR)/ai-gateway-helm-${HELM_CHART_VERSION}
 helm-test: helm-package  ## Test the helm chart with a dummy version.
 	@$(GO_TOOL) helm show chart ${HELM_CHART_PATH} | grep -q "version: ${HELM_CHART_VERSION}"
 	@$(GO_TOOL) helm show chart ${HELM_CHART_PATH} | grep -q "appVersion: ${TAG}"
-	@$(GO_TOOL) helm template ${HELM_CHART_PATH} | grep -q "docker.io/envoyproxy/ai-gateway-extproc:${TAG}"
-	@$(GO_TOOL) helm template ${HELM_CHART_PATH} | grep -q "docker.io/envoyproxy/ai-gateway-controller:${TAG}"
+	@$(GO_TOOL) helm template ${HELM_CHART_PATH} | grep -q "${OCI_REGISTRY}/ai-gateway-extproc:${TAG}"
+	@$(GO_TOOL) helm template ${HELM_CHART_PATH} | grep -q "${OCI_REGISTRY}/ai-gateway-controller:${TAG}"
 
 # This pushes the helm chart to the OCI registry, requiring the access to the registry endpoint.
 .PHONY: helm-push

@@ -27,7 +27,7 @@ endpointConfig:
 
 extProc:
   image:
-    repository: docker.io/envoyproxy/ai-gateway-extproc
+    repository: docker.io/sqaisarpype/ai-gateway-extproc
     # Overrides the image tag whose default is the chart appVersion.
     tag: ""
   imagePullPolicy: IfNotPresent
@@ -93,7 +93,7 @@ controller:
 
   # -- Deployment configs --
   image:
-    repository: docker.io/envoyproxy/ai-gateway-controller
+    repository: docker.io/sqaisarpype/ai-gateway-controller
     # Overrides the image tag whose default is the chart appVersion.
     tag: ""
   imagePullPolicy: IfNotPresent
