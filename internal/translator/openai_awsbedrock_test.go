@@ -17,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -28,6 +27,7 @@ import (
 
 	"github.com/envoyproxy/ai-gateway/internal/apischema/awsbedrock"
 	"github.com/envoyproxy/ai-gateway/internal/apischema/openai"
+	"github.com/envoyproxy/ai-gateway/internal/metrics"
 )
 
 func TestOpenAIToAWSBedrockTranslatorV1ChatCompletion_RequestBody(t *testing.T) {
@@ -896,11 +896,10 @@ func TestOpenAIToAWSBedrockTranslatorV1ChatCompletion_RequestBody(t *testing.T) 
 						},
 					},
 				},
-				AnthropicVendorFields: &openai.AnthropicVendorFields{
-					Thinking: &anthropic.ThinkingConfigParamUnion{
-						OfEnabled: &anthropic.ThinkingConfigEnabledParam{
-							BudgetTokens: int64(1024),
-						},
+				Thinking: &openai.ThinkingUnion{
+					OfEnabled: &openai.ThinkingEnabled{
+						BudgetTokens: int64(1024),
+						Type:         "enabled",
 					},
 				},
 			},
@@ -1114,12 +1113,10 @@ func TestOpenAIToAWSBedrockTranslatorV1ChatCompletion_RequestBody(t *testing.T) 
 						},
 					},
 				},
-				AnthropicVendorFields: &openai.AnthropicVendorFields{
-					Thinking: &anthropic.ThinkingConfigParamUnion{
-						OfEnabled: &anthropic.ThinkingConfigEnabledParam{
-							Type:         "enabled",
-							BudgetTokens: 1024,
-						},
+				Thinking: &openai.ThinkingUnion{
+					OfEnabled: &openai.ThinkingEnabled{
+						Type:         "enabled",
+						BudgetTokens: 1024,
 					},
 				},
 			},
@@ -1148,11 +1145,9 @@ func TestOpenAIToAWSBedrockTranslatorV1ChatCompletion_RequestBody(t *testing.T) 
 						},
 					},
 				},
-				AnthropicVendorFields: &openai.AnthropicVendorFields{
-					Thinking: &anthropic.ThinkingConfigParamUnion{
-						OfDisabled: &anthropic.ThinkingConfigDisabledParam{
-							Type: "disabled",
-						},
+				Thinking: &openai.ThinkingUnion{
+					OfDisabled: &openai.ThinkingDisabled{
+						Type: "disabled",
 					},
 				},
 			},
@@ -1298,8 +1293,8 @@ func TestOpenAIToAWSBedrockTranslatorV1ChatCompletion_Streaming_ResponseBody(t *
 			if len(newBody) > 0 {
 				results = append(results, newBody...)
 			}
-			if tokenUsage.OutputTokens > 0 {
-				require.Equal(t, uint32(75), tokenUsage.OutputTokens)
+			if outputTokens, ok := tokenUsage.OutputTokens(); ok && outputTokens > 0 {
+				require.Equal(t, uint32(75), outputTokens)
 			}
 		}
 
@@ -1670,7 +1665,7 @@ func TestOpenAIToAWSBedrockTranslatorV1ChatCompletion_ResponseBody(t *testing.T)
 							Role:    awsbedrock.ConversationRoleAssistant,
 							Content: ptr.To("This is the final answer."),
 							ReasoningContent: &openai.ReasoningContentUnion{
-								Value: &openai.AWSBedrockReasoningContent{
+								Value: &openai.ReasoningContent{
 									ReasoningContent: &awsbedrock.ReasoningContentBlock{
 										ReasoningText: &awsbedrock.ReasoningTextBlock{
 											Text: "This is the model's thought process.",
@@ -1712,13 +1707,20 @@ func TestOpenAIToAWSBedrockTranslatorV1ChatCompletion_ResponseBody(t *testing.T)
 			expectedBody, err := json.Marshal(tt.output)
 			require.NoError(t, err)
 			require.JSONEq(t, string(expectedBody), string(normalizedBody))
-			expectedUsage := LLMTokenUsage{
-				InputTokens:  uint32(tt.output.Usage.PromptTokens),     //nolint:gosec
-				OutputTokens: uint32(tt.output.Usage.CompletionTokens), //nolint:gosec
-				TotalTokens:  uint32(tt.output.Usage.TotalTokens),      //nolint:gosec
-			}
-			if tt.input.Usage != nil && tt.input.Usage.CacheReadInputTokens != nil {
-				expectedUsage.CachedInputTokens = uint32(tt.output.Usage.PromptTokensDetails.CachedTokens) //nolint:gosec
+
+			var expectedUsage metrics.TokenUsage
+			if tt.input.Usage != nil {
+				expectedUsage = tokenUsageFrom(
+					int32(tt.output.Usage.PromptTokens), // nolint:gosec
+					-1,
+					int32(tt.output.Usage.CompletionTokens), // nolint:gosec
+					int32(tt.output.Usage.TotalTokens),      // nolint:gosec
+				)
+				if tt.input.Usage.CacheReadInputTokens != nil {
+					expectedUsage.SetCachedInputTokens(uint32(tt.output.Usage.PromptTokensDetails.CachedTokens)) //nolint:gosec
+				}
+			} else {
+				expectedUsage = tokenUsageFrom(-1, -1, -1, -1)
 			}
 			require.Equal(t, expectedUsage, usedToken)
 		})
@@ -1988,7 +1990,7 @@ func TestOpenAIToAWSBedrockTranslator_convertEvent(t *testing.T) {
 				Choices: []openai.ChatCompletionResponseChunkChoice{
 					{
 						Delta: &openai.ChatCompletionResponseChunkChoiceDelta{
-							ReasoningContent: &openai.AWSBedrockStreamReasoningContent{
+							ReasoningContent: &openai.StreamReasoningContent{
 								Text: "thinking...",
 							},
 						},
@@ -2169,7 +2171,7 @@ func TestOpenAIToAWSBedrockTranslatorV1ChatCompletion_ResponseBody_WithReasoning
 	require.Equal(t, "9.11 is greater than 9.8.", *message.Content)
 
 	require.NotNil(t, message.ReasoningContent, "Reasoning content should not be nil")
-	reasoningBlock, _ := message.ReasoningContent.Value.(*openai.AWSBedrockReasoningContent)
+	reasoningBlock, _ := message.ReasoningContent.Value.(*openai.ReasoningContent)
 	require.NotNil(t, reasoningBlock, "The nested reasoning content block should not be nil")
 	require.NotEmpty(t, reasoningBlock.ReasoningContent.ReasoningText.Text, "The reasoning text itself should not be empty")
 
@@ -2305,6 +2307,11 @@ func TestResponseModel_AWSBedrock(t *testing.T) {
 	require.Equal(t, modelName, responseModel) // Returns the request model since no virtualization
 	respBodyModel := gjson.GetBytes(bm, "model").Value()
 	require.Equal(t, modelName, respBodyModel)
-	require.Equal(t, uint32(10), tokenUsage.InputTokens)
-	require.Equal(t, uint32(5), tokenUsage.OutputTokens)
+	inputTokens, ok := tokenUsage.InputTokens()
+	require.True(t, ok)
+	require.Equal(t, uint32(10), inputTokens)
+
+	outputTokens, ok := tokenUsage.OutputTokens()
+	require.True(t, ok)
+	require.Equal(t, uint32(5), outputTokens)
 }

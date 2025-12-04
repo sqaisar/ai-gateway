@@ -18,6 +18,8 @@ import (
 
 	anthropicschema "github.com/envoyproxy/ai-gateway/internal/apischema/anthropic"
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
+	"github.com/envoyproxy/ai-gateway/internal/metrics"
+	tracing "github.com/envoyproxy/ai-gateway/internal/tracing/api"
 )
 
 // NewAnthropicToAnthropicTranslator creates a passthrough translator for Anthropic.
@@ -73,8 +75,8 @@ func (a *anthropicToAnthropicTranslator) ResponseHeaders(_ map[string]string) (
 }
 
 // ResponseBody implements [AnthropicMessagesTranslator.ResponseBody].
-func (a *anthropicToAnthropicTranslator) ResponseBody(_ map[string]string, body io.Reader, _ bool) (
-	newHeaders []internalapi.Header, newBody []byte, tokenUsage LLMTokenUsage, responseModel string, err error,
+func (a *anthropicToAnthropicTranslator) ResponseBody(_ map[string]string, body io.Reader, _ bool, _ tracing.MessageSpan) (
+	newHeaders []internalapi.Header, newBody []byte, tokenUsage metrics.TokenUsage, responseModel string, err error,
 ) {
 	if a.stream {
 		var buf []byte
@@ -101,7 +103,7 @@ func (a *anthropicToAnthropicTranslator) ResponseBody(_ map[string]string, body 
 
 // extractUsageFromBufferEvent extracts the token usage from the buffered event.
 // It scans complete lines and returns the latest usage found in this batch.
-func (a *anthropicToAnthropicTranslator) extractUsageFromBufferEvent() (tokenUsage LLMTokenUsage) {
+func (a *anthropicToAnthropicTranslator) extractUsageFromBufferEvent() (tokenUsage metrics.TokenUsage) {
 	for {
 		i := bytes.IndexByte(a.buffered, '\n')
 		if i == -1 {
@@ -131,4 +133,15 @@ func (a *anthropicToAnthropicTranslator) extractUsageFromBufferEvent() (tokenUsa
 			tokenUsage = ExtractLLMTokenUsageFromDeltaUsage(eventUnion.Usage)
 		}
 	}
+}
+
+// ResponseError implements [AnthropicMessagesTranslator] for Anthropic to AWS Bedrock Anthropic translation.
+func (a *anthropicToAnthropicTranslator) ResponseError(map[string]string, io.Reader) (
+	newHeaders []internalapi.Header,
+	mutatedBody []byte,
+	err error,
+) {
+	// TODO: implement the non-anthropic error conversion logic here. For now, we just return the original error
+	// 	from the upstream as-is.
+	return
 }

@@ -32,14 +32,15 @@ import (
 
 const (
 	mcpBackendListenerName = "aigateway-mcp-backend-listener"
-	jwtAuthnFilterName     = "envoy.filters.http.jwt_authn"
-	apiKeyAuthFilterName   = "envoy.filters.http.api_key_auth" // #nosec G101
+	filterNameJWTAuthn     = "envoy.filters.http.jwt_authn"
+	filterNameAPIKeyAuth   = "envoy.filters.http.api_key_auth" // #nosec G101
+	filterNameExtAuth      = "envoy.filters.http.ext_authz"
 )
 
 // Generate the resources needed to support MCP Gateway functionality.
-func (s *Server) maybeGenerateResourcesForMCPGateway(req *egextension.PostTranslateModifyRequest) {
+func (s *Server) maybeGenerateResourcesForMCPGateway(req *egextension.PostTranslateModifyRequest) error {
 	if len(req.Listeners) == 0 || len(req.Routes) == 0 {
-		return // Nothing to do, mostly for unit tests.
+		return nil // Nothing to do, mostly for unit tests.
 	}
 	// Update existing MCP routes to remove JWT authn filter from non-proxy rules.
 	// Order matters: do this before moving rules to the backend listener.
@@ -51,8 +52,15 @@ func (s *Server) maybeGenerateResourcesForMCPGateway(req *egextension.PostTransl
 	// Only create the backend listener if there are routes for it
 	if mcpBackendRoutes != nil {
 		// Extract MCP backend filters from existing listeners and create the backend listener with those filters.
-		mcpBackendHTTPFilters, accessLogConfig := s.extractMCPBackendFiltersFromMCPProxyListener(req.Listeners)
-		req.Listeners = append(req.Listeners, s.createBackendListener(mcpBackendHTTPFilters, accessLogConfig))
+		mcpBackendHTTPFilters, accessLogConfig, err := s.extractMCPBackendFiltersFromMCPProxyListener(req.Listeners)
+		if err != nil {
+			return fmt.Errorf("failed to extract MCP backend filters from existing listeners: %w", err)
+		}
+		l, err := s.createBackendListener(mcpBackendHTTPFilters, accessLogConfig)
+		if err != nil {
+			return fmt.Errorf("failed to create MCP backend listener: %w", err)
+		}
+		req.Listeners = append(req.Listeners, l)
 		req.Routes = append(req.Routes, mcpBackendRoutes)
 	}
 
@@ -62,15 +70,18 @@ func (s *Server) maybeGenerateResourcesForMCPGateway(req *egextension.PostTransl
 	// Modify OAuth custom response filters to add WWW-Authenticate headers.
 	// TODO: remove this step once Envoy Gateway supports this natively in the BackendTrafficPolicy ResponseOverride.
 	// https://github.com/envoyproxy/gateway/pull/6308
-	s.modifyMCPOAuthCustomResponseFilters(req.Listeners)
+	if err := s.modifyMCPOAuthCustomResponseFilters(req.Listeners); err != nil {
+		return fmt.Errorf("failed to modify MCP OAuth CustomResponse filters: %w", err)
+	}
 
 	// TODO: remove this step once Envoy Gateway supports this natively in the BackendTrafficPolicy ResponseOverride.
 	// https://github.com/envoyproxy/gateway/pull/6308
 	s.modifyMCPOAuthCustomResponseRoute(req.Routes)
+	return nil
 }
 
 // createBackendListener creates the backend listener for MCP Gateway.
-func (s *Server) createBackendListener(mcpHTTPFilters []*httpconnectionmanagerv3.HttpFilter, accessLogConfig []*accesslogv3.AccessLog) *listenerv3.Listener {
+func (s *Server) createBackendListener(mcpHTTPFilters []*httpconnectionmanagerv3.HttpFilter, accessLogConfig []*accesslogv3.AccessLog) (*listenerv3.Listener, error) {
 	httpConManager := &httpconnectionmanagerv3.HttpConnectionManager{
 		StatPrefix: fmt.Sprintf("%s-http", mcpBackendListenerName),
 		AccessLog:  accessLogConfig,
@@ -112,19 +123,29 @@ func (s *Server) createBackendListener(mcpHTTPFilters []*httpconnectionmanagerv3
 			},
 		)
 	}
+	a, err := toAny(headersToMetadata)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal header to metadata filter config: %w", err)
+	}
 	httpConManager.HttpFilters = append(httpConManager.HttpFilters, &httpconnectionmanagerv3.HttpFilter{
-		Name: "envoy.filters.http.header_to_metadata",
-		ConfigType: &httpconnectionmanagerv3.HttpFilter_TypedConfig{
-			TypedConfig: mustToAny(headersToMetadata),
-		},
+		Name:       "envoy.filters.http.header_to_metadata",
+		ConfigType: &httpconnectionmanagerv3.HttpFilter_TypedConfig{TypedConfig: a},
 	})
 
 	// Add Router filter as the terminal HTTP filter.
+	a, err = toAny(&routerv3.Router{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal router filter config: %w", err)
+	}
 	httpConManager.HttpFilters = append(httpConManager.HttpFilters, &httpconnectionmanagerv3.HttpFilter{
 		Name:       wellknown.Router,
-		ConfigType: &httpconnectionmanagerv3.HttpFilter_TypedConfig{TypedConfig: mustToAny(&routerv3.Router{})},
+		ConfigType: &httpconnectionmanagerv3.HttpFilter_TypedConfig{TypedConfig: a},
 	})
 
+	a, err = toAny(httpConManager)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal HTTP Connection Manager for backend listener: %w", err)
+	}
 	return &listenerv3.Listener{
 		Name: mcpBackendListenerName,
 		Address: &corev3.Address{
@@ -142,15 +163,13 @@ func (s *Server) createBackendListener(mcpHTTPFilters []*httpconnectionmanagerv3
 			{
 				Filters: []*listenerv3.Filter{
 					{
-						Name: wellknown.HTTPConnectionManager,
-						ConfigType: &listenerv3.Filter_TypedConfig{
-							TypedConfig: mustToAny(httpConManager),
-						},
+						Name:       wellknown.HTTPConnectionManager,
+						ConfigType: &listenerv3.Filter_TypedConfig{TypedConfig: a},
 					},
 				},
 			},
 		},
-	}
+	}, nil
 }
 
 // maybeUpdateMCPRoutes updates the mcp routes with necessary changes for MCP Gateway.
@@ -165,7 +184,7 @@ func (s *Server) maybeUpdateMCPRoutes(routes []*routev3.RouteConfiguration) {
 					}
 					// Remove the authn filters from the well-known and backend routes.
 					// TODO: remove this step once the SecurityPolicy can target the MCP proxy route rule only.
-					for _, filterName := range []string{jwtAuthnFilterName, apiKeyAuthFilterName} {
+					for _, filterName := range []string{filterNameJWTAuthn, filterNameAPIKeyAuth, filterNameExtAuth} {
 						if _, ok := route.TypedPerFilterConfig[filterName]; ok {
 							s.log.Info("removing authn filter from well-known and backend routes", "route", route.Name, "filter", filterName)
 							delete(route.TypedPerFilterConfig, filterName)
@@ -289,7 +308,7 @@ func (s *Server) modifyMCPGatewayGeneratedCluster(clusters []*clusterv3.Cluster)
 // When using the envoy Gateway `mergeGateways` feature, this method will receive all the listeners attached to the GatewayClass instead.
 // This is still safe because in the end all Gateway objects will be attached to the same "infrastructure", so it is still safe to assume
 // that all received listeners will have the same access log configuration
-func (s *Server) extractMCPBackendFiltersFromMCPProxyListener(listeners []*listenerv3.Listener) ([]*httpconnectionmanagerv3.HttpFilter, []*accesslogv3.AccessLog) {
+func (s *Server) extractMCPBackendFiltersFromMCPProxyListener(listeners []*listenerv3.Listener) ([]*httpconnectionmanagerv3.HttpFilter, []*accesslogv3.AccessLog, error) {
 	var (
 		mcpHTTPFilters  []*httpconnectionmanagerv3.HttpFilter
 		accessLogConfig []*accesslogv3.AccessLog
@@ -336,8 +355,11 @@ func (s *Server) extractMCPBackendFiltersFromMCPProxyListener(listeners []*liste
 				httpConManager.HttpFilters = remainingFilters
 
 				// Write the updated HCM back to the filter chain.
-				chain.Filters[hcmIndex].ConfigType = &listenerv3.Filter_TypedConfig{
-					TypedConfig: mustToAny(httpConManager),
+				tc := &listenerv3.Filter_TypedConfig{}
+				tc.TypedConfig, err = toAny(httpConManager)
+				chain.Filters[hcmIndex].ConfigType = tc
+				if err != nil {
+					return nil, nil, fmt.Errorf("failed to marshal updated HCM for listener %s: %w", listener.Name, err)
 				}
 			}
 		}
@@ -346,7 +368,7 @@ func (s *Server) extractMCPBackendFiltersFromMCPProxyListener(listeners []*liste
 	if len(mcpHTTPFilters) > 0 {
 		s.log.Info("Extracted MCP HTTP filters", "count", len(mcpHTTPFilters))
 	}
-	return mcpHTTPFilters, accessLogConfig
+	return mcpHTTPFilters, accessLogConfig, nil
 }
 
 // isMCPBackendHTTPFilter checks if an HTTP filter is used for MCP backend processing.
@@ -370,7 +392,7 @@ func (s *Server) isMCPOAuthCustomResponseFilter(filter *httpconnectionmanagerv3.
 
 // modifyMCPOAuthCustomResponseFilter modifies a CustomResponse filter to add WWW-Authenticate header
 // to the response_headers_to_add field in the LocalResponsePolicy.
-func (s *Server) modifyMCPOAuthCustomResponseFilter(filter *httpconnectionmanagerv3.HttpFilter) error {
+func (s *Server) modifyMCPOAuthCustomResponseFilter(filter *httpconnectionmanagerv3.HttpFilter) (err error) {
 	// Unmarshal the CustomResponse configuration.
 	if filter.ConfigType == nil {
 		return fmt.Errorf("CustomResponse filter has no configuration")
@@ -382,7 +404,7 @@ func (s *Server) modifyMCPOAuthCustomResponseFilter(filter *httpconnectionmanage
 	}
 
 	var customResponse custom_responsev3.CustomResponse
-	if err := typedConfig.TypedConfig.UnmarshalTo(&customResponse); err != nil {
+	if err = typedConfig.TypedConfig.UnmarshalTo(&customResponse); err != nil {
 		return fmt.Errorf("failed to unmarshal CustomResponse configuration: %w", err)
 	}
 
@@ -408,7 +430,7 @@ func (s *Server) modifyMCPOAuthCustomResponseFilter(filter *httpconnectionmanage
 
 		// Check if this is a LocalResponsePolicy.
 		var localResponsePolicy local_response_policyv3.LocalResponsePolicy
-		if err := action.TypedConfig.UnmarshalTo(&localResponsePolicy); err != nil {
+		if err = action.TypedConfig.UnmarshalTo(&localResponsePolicy); err != nil {
 			s.log.Info("Skipping non-LocalResponsePolicy action", "error", err.Error())
 			continue
 		}
@@ -424,9 +446,11 @@ func (s *Server) modifyMCPOAuthCustomResponseFilter(filter *httpconnectionmanage
 				if source := bodyFormat.TextFormatSource; source != nil {
 					switch {
 					case source.GetFilename() != "":
-						content, err := os.ReadFile(source.GetFilename())
+						var content []byte
+						content, err = os.ReadFile(source.GetFilename())
 						if err != nil {
-							s.log.Error(err, "reading WWW-Authenticate header value from CustomResponse bod")
+							s.log.Error(err, "reading WWW-Authenticate header value from CustomResponse body")
+							return err
 						}
 						wwwAuthenticateValue = string(content)
 					case source.GetEnvironmentVariable() != "":
@@ -470,18 +494,24 @@ func (s *Server) modifyMCPOAuthCustomResponseFilter(filter *httpconnectionmanage
 		}
 
 		// Marshal the modified LocalResponsePolicy back.
-		action.TypedConfig = mustToAny(&localResponsePolicy)
+		action.TypedConfig, err = toAny(&localResponsePolicy)
+		if err != nil {
+			return fmt.Errorf("failed to marshal modified LocalResponsePolicy: %w", err)
+		}
 	}
 
 	// Marshal the modified CustomResponse configuration back.
-	typedConfig.TypedConfig = mustToAny(&customResponse)
+	typedConfig.TypedConfig, err = toAny(&customResponse)
+	if err != nil {
+		return fmt.Errorf("failed to marshal modified CustomResponse configuration: %w", err)
+	}
 
 	return nil
 }
 
 // modifyMCPOAuthCustomResponseFilters finds and modifies OAuth custom response filters
 // in the original listeners to add WWW-Authenticate headers.
-func (s *Server) modifyMCPOAuthCustomResponseFilters(listeners []*listenerv3.Listener) {
+func (s *Server) modifyMCPOAuthCustomResponseFilters(listeners []*listenerv3.Listener) error {
 	for _, listener := range listeners {
 		// Skip the backend MCP listener if it already exists.
 		if listener.Name == mcpBackendListenerName {
@@ -517,12 +547,15 @@ func (s *Server) modifyMCPOAuthCustomResponseFilters(listeners []*listenerv3.Lis
 
 			// If we modified any filters, update the HCM in the filter chain.
 			if modified {
-				chain.Filters[hcmIndex].ConfigType = &listenerv3.Filter_TypedConfig{
-					TypedConfig: mustToAny(httpConManager),
+				a, err := toAny(httpConManager)
+				if err != nil {
+					return fmt.Errorf("failed to marshal updated HCM for listener %s: %w", listener.Name, err)
 				}
+				chain.Filters[hcmIndex].ConfigType = &listenerv3.Filter_TypedConfig{TypedConfig: a}
 			}
 		}
 	}
+	return nil
 }
 
 func (s *Server) modifyMCPOAuthCustomResponseRoute(routes []*routev3.RouteConfiguration) {
@@ -578,8 +611,11 @@ func (s *Server) modifyMCPOAuthCustomResponseRoute(routes []*routev3.RouteConfig
 const (
 	oauthProtectedResourcePath   = "/.well-known/oauth-protected-resource"
 	oauthAuthorizationServerPath = "/.well-known/oauth-authorization-server"
+	oidcAuthorizationServerPath  = "/.well-known/openid-configuration"
 )
 
 func isWellKnownOAuthPath(path string) bool {
-	return strings.Contains(path, oauthProtectedResourcePath) || strings.Contains(path, oauthAuthorizationServerPath)
+	return strings.Contains(path, oauthProtectedResourcePath) ||
+		strings.Contains(path, oauthAuthorizationServerPath) ||
+		strings.Contains(path, oidcAuthorizationServerPath)
 }

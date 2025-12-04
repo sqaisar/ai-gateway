@@ -121,7 +121,7 @@ func TestOpenAIMessagesToGeminiContents(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			contents, systemInstruction, err := openAIMessagesToGeminiContents(tc.messages)
+			contents, systemInstruction, err := openAIMessagesToGeminiContents(tc.messages, "gemini-3-pro")
 
 			if tc.expectedErrorMsg != "" || err != nil {
 				require.Error(t, err)
@@ -318,6 +318,126 @@ func TestAssistantMsgToGeminiParts(t *testing.T) {
 			},
 			expectedParts:     nil,
 			expectedToolCalls: map[string]string{},
+		},
+		{
+			name: "thinking content with valid text",
+			msg: openai.ChatCompletionAssistantMessageParam{
+				Content: openai.StringOrAssistantRoleContentUnion{
+					Value: []openai.ChatCompletionAssistantMessageParamContent{
+						{
+							Type: openai.ChatCompletionAssistantMessageParamContentTypeThinking,
+							Text: ptr.To("Let me think step by step..."),
+						},
+					},
+				},
+				Role: openai.ChatMessageRoleAssistant,
+			},
+			expectedParts: []*genai.Part{
+				{
+					Text:    "Let me think step by step...",
+					Thought: true,
+				},
+			},
+			expectedToolCalls: map[string]string{},
+		},
+		{
+			name: "thinking content with nil text",
+			msg: openai.ChatCompletionAssistantMessageParam{
+				Content: openai.StringOrAssistantRoleContentUnion{
+					Value: []openai.ChatCompletionAssistantMessageParamContent{
+						{
+							Type: openai.ChatCompletionAssistantMessageParamContentTypeThinking,
+							Text: nil,
+						},
+					},
+				},
+				Role: openai.ChatMessageRoleAssistant,
+			},
+			expectedParts:     nil,
+			expectedToolCalls: map[string]string{},
+		},
+		{
+			name: "thinking content with empty text",
+			msg: openai.ChatCompletionAssistantMessageParam{
+				Content: openai.StringOrAssistantRoleContentUnion{
+					Value: []openai.ChatCompletionAssistantMessageParamContent{
+						{
+							Type: openai.ChatCompletionAssistantMessageParamContentTypeThinking,
+							Text: ptr.To(""),
+						},
+					},
+				},
+				Role: openai.ChatMessageRoleAssistant,
+			},
+			expectedParts:     nil,
+			expectedToolCalls: map[string]string{},
+		},
+		{
+			name: "mixed content with thinking and regular text",
+			msg: openai.ChatCompletionAssistantMessageParam{
+				Content: openai.StringOrAssistantRoleContentUnion{
+					Value: []openai.ChatCompletionAssistantMessageParamContent{
+						{
+							Type: openai.ChatCompletionAssistantMessageParamContentTypeThinking,
+							Text: ptr.To("First, I need to analyze this problem..."),
+						},
+						{
+							Type: openai.ChatCompletionAssistantMessageParamContentTypeText,
+							Text: ptr.To("Based on my analysis, here's the answer."),
+						},
+					},
+				},
+				Role: openai.ChatMessageRoleAssistant,
+			},
+			expectedParts: []*genai.Part{
+				{
+					Text:    "First, I need to analyze this problem...",
+					Thought: true,
+				},
+				genai.NewPartFromText("Based on my analysis, here's the answer."),
+			},
+			expectedToolCalls: map[string]string{},
+		},
+		{
+			name: "thinking content mixed with tool calls",
+			msg: openai.ChatCompletionAssistantMessageParam{
+				Content: openai.StringOrAssistantRoleContentUnion{
+					Value: []openai.ChatCompletionAssistantMessageParamContent{
+						{
+							Type: openai.ChatCompletionAssistantMessageParamContentTypeThinking,
+							Text: ptr.To("I need to call a function to get the weather"),
+						},
+						{
+							Type: openai.ChatCompletionAssistantMessageParamContentTypeText,
+							Text: ptr.To("Let me get the weather for you"),
+						},
+					},
+				},
+				Role: openai.ChatMessageRoleAssistant,
+				ToolCalls: []openai.ChatCompletionMessageToolCallParam{
+					{
+						ID: ptr.To("call_weather"),
+						Function: openai.ChatCompletionMessageToolCallFunctionParam{
+							Name:      "get_weather",
+							Arguments: `{"location":"San Francisco"}`,
+						},
+						Type: openai.ChatCompletionMessageToolCallTypeFunction,
+					},
+				},
+			},
+			expectedParts: []*genai.Part{
+				genai.NewPartFromFunctionCall("get_weather", map[string]any{
+					"location": "San Francisco",
+				}),
+				{
+					Text:    "I need to call a function to get the weather",
+					Thought: true,
+				},
+				genai.NewPartFromText("Let me get the weather for you"),
+			},
+			expectedToolCalls: map[string]string{
+				"call_weather": "get_weather",
+			},
 		},
 	}
 
@@ -847,7 +967,7 @@ func TestUserMsgToGeminiParts(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			parts, err := userMsgToGeminiParts(tc.msg)
+			parts, err := userMsgToGeminiParts(tc.msg, "gemini-3-pro")
 
 			if tc.expectedErrMsg != "" || err != nil {
 				require.Error(t, err)
@@ -1060,7 +1180,7 @@ func TestOpenAIReqToGeminiGenerationConfig(t *testing.T) {
 				},
 			},
 			expectedResponseMode: responseModeNone,
-			requestModel:         "gemini-2.5-flash",
+			requestModel:         "gemini-3-pro",
 		},
 		{
 			name: "reasoning effort medium",
@@ -1073,7 +1193,7 @@ func TestOpenAIReqToGeminiGenerationConfig(t *testing.T) {
 				},
 			},
 			expectedResponseMode: responseModeNone,
-			requestModel:         "gemini-2.5-flash",
+			requestModel:         "gemini-3-pro",
 		},
 		{
 			name: "reasoning effort unsupported",
@@ -1081,7 +1201,7 @@ func TestOpenAIReqToGeminiGenerationConfig(t *testing.T) {
 				ReasoningEffort: openaigo.ReasoningEffortHigh,
 			},
 			expectedErrMsg: "reasoning effort:",
-			requestModel:   "gemini-2.5-flash",
+			requestModel:   "gemini-3-pro",
 		},
 	}
 
@@ -1829,24 +1949,27 @@ func TestGeminiFinishReasonToOpenAI(t *testing.T) {
 	}
 }
 
-func TestExtractTextFromGeminiParts(t *testing.T) {
+func TestExtractTextAndThoughtSummaryFromGeminiParts(t *testing.T) {
 	tests := []struct {
-		name         string
-		parts        []*genai.Part
-		responseMode geminiResponseMode
-		expected     string
+		name                   string
+		parts                  []*genai.Part
+		responseMode           geminiResponseMode
+		expectedThoughtSummary string
+		expectedText           string
 	}{
 		{
-			name:         "nil parts",
-			parts:        nil,
-			responseMode: responseModeNone,
-			expected:     "",
+			name:                   "nil parts",
+			parts:                  nil,
+			responseMode:           responseModeNone,
+			expectedThoughtSummary: "",
+			expectedText:           "",
 		},
 		{
-			name:         "empty parts",
-			parts:        []*genai.Part{},
-			responseMode: responseModeNone,
-			expected:     "",
+			name:                   "empty parts",
+			parts:                  []*genai.Part{},
+			responseMode:           responseModeNone,
+			expectedThoughtSummary: "",
+			expectedText:           "",
 		},
 		{
 			name: "multiple text parts without regex mode",
@@ -1854,8 +1977,9 @@ func TestExtractTextFromGeminiParts(t *testing.T) {
 				{Text: "Hello, "},
 				{Text: "world!"},
 			},
-			responseMode: responseModeJSON,
-			expected:     "Hello, world!",
+			responseMode:           responseModeJSON,
+			expectedThoughtSummary: "",
+			expectedText:           "Hello, world!",
 		},
 		{
 			name: "regex mode with mixed quoted and unquoted text",
@@ -1864,40 +1988,56 @@ func TestExtractTextFromGeminiParts(t *testing.T) {
 				{Text: `unquoted`},
 				{Text: `"negative"`},
 			},
-			responseMode: responseModeRegex,
-			expected:     "positiveunquotednegative",
+			responseMode:           responseModeRegex,
+			expectedThoughtSummary: "",
+			expectedText:           "positiveunquotednegative",
 		},
 		{
 			name: "regex mode with only double-quoted first and last words",
 			parts: []*genai.Part{
 				{Text: "\"\"ERROR\" Unable to connect to database \"DatabaseModule\"\""},
 			},
-			responseMode: responseModeRegex,
-			expected:     "\"ERROR\" Unable to connect to database \"DatabaseModule\"",
+			responseMode:           responseModeRegex,
+			expectedThoughtSummary: "",
+			expectedText:           "\"ERROR\" Unable to connect to database \"DatabaseModule\"",
 		},
 		{
 			name: "non-regex mode with double-quoted text (should not remove quotes)",
 			parts: []*genai.Part{
 				{Text: `"positive"`},
 			},
-			responseMode: responseModeJSON,
-			expected:     `"positive"`,
+			responseMode:           responseModeJSON,
+			expectedThoughtSummary: "",
+			expectedText:           `"positive"`,
 		},
 		{
 			name: "regex mode with text containing internal quotes",
 			parts: []*genai.Part{
 				{Text: `"He said \"hello\" to me"`},
 			},
-			responseMode: responseModeRegex,
-			expected:     `He said \"hello\" to me`,
+			responseMode:           responseModeRegex,
+			expectedThoughtSummary: "",
+			expectedText:           `He said \"hello\" to me`,
+		},
+		{
+			name: "test thought summary",
+			parts: []*genai.Part{
+				{Text: "Let me think step by step", Thought: true},
+				{Text: "Here is the conclusion"},
+			},
+			expectedThoughtSummary: "Let me think step by step",
+			expectedText:           "Here is the conclusion",
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			result := extractTextFromGeminiParts(tc.parts, tc.responseMode)
-			if result != tc.expected {
-				t.Errorf("extractTextFromGeminiParts() = %q, want %q", result, tc.expected)
+			thoughtSummary, text := extractTextAndThoughtSummaryFromGeminiParts(tc.parts, tc.responseMode)
+			if thoughtSummary != tc.expectedThoughtSummary {
+				t.Errorf("thought summary result of extractTextAndThoughtSummaryFromGeminiParts() = %q, want %q", thoughtSummary, tc.expectedText)
+			}
+			if text != tc.expectedText {
+				t.Errorf("text result of extractTextAndThoughtSummaryFromGeminiParts() = %q, want %q", text, tc.expectedText)
 			}
 		})
 	}

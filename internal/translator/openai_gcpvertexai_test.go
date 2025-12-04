@@ -24,6 +24,7 @@ import (
 
 	"github.com/envoyproxy/ai-gateway/internal/apischema/openai"
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
+	"github.com/envoyproxy/ai-gateway/internal/metrics"
 )
 
 // TestResponseModel_GCPVertexAIStreaming tests that GCP Vertex AI streaming returns the request model
@@ -57,8 +58,12 @@ func TestResponseModel_GCPVertexAIStreaming(t *testing.T) {
 	_, _, tokenUsage, responseModel, err := translator.ResponseBody(nil, bytes.NewReader([]byte(streamResponse)), true, nil)
 	require.NoError(t, err)
 	require.Equal(t, modelName, responseModel) // Returns the request model since no virtualization
-	require.Equal(t, uint32(10), tokenUsage.InputTokens)
-	require.Equal(t, uint32(5), tokenUsage.OutputTokens)
+	inputTokens, ok := tokenUsage.InputTokens()
+	require.True(t, ok)
+	require.Equal(t, uint32(10), inputTokens)
+	outputTokens, ok := tokenUsage.OutputTokens()
+	require.True(t, ok)
+	require.Equal(t, uint32(5), outputTokens)
 }
 
 func TestOpenAIToGCPVertexAITranslatorV1ChatCompletion_RequestBody(t *testing.T) {
@@ -228,7 +233,7 @@ func TestOpenAIToGCPVertexAITranslatorV1ChatCompletion_RequestBody(t *testing.T)
                 {
                     "name": "test_function",
                     "description": "A test function",
-                    "parameters": {
+                    "parametersJsonSchema": {
                         "type": "object",
                         "properties": {
                             "param1": {
@@ -543,12 +548,11 @@ func TestOpenAIToGCPVertexAITranslatorV1ChatCompletion_RequestBody(t *testing.T)
 						},
 					},
 				},
-				GCPVertexAIVendorFields: &openai.GCPVertexAIVendorFields{
-					GenerationConfig: &openai.GCPVertexAIGenerationConfig{
-						ThinkingConfig: &genai.ThinkingConfig{
-							IncludeThoughts: true,
-							ThinkingBudget:  ptr.To(int32(1000)),
-						},
+				Thinking: &openai.ThinkingUnion{
+					OfEnabled: &openai.ThinkingEnabled{
+						IncludeThoughts: true,
+						BudgetTokens:    1000,
+						Type:            "enabled",
 					},
 				},
 			},
@@ -611,7 +615,7 @@ func TestOpenAIToGCPVertexAITranslatorV1ChatCompletion_RequestBody(t *testing.T)
 		{
 			name: "Request with media resolution fields",
 			input: openai.ChatCompletionRequest{
-				Model:       "gemini-1.5-pro",
+				Model:       "gemini-3-pro",
 				Temperature: ptr.To(0.7),
 				MaxTokens:   ptr.To(int64(1024)),
 				Messages: []openai.ChatCompletionMessageParamUnion{
@@ -648,8 +652,8 @@ func TestOpenAIToGCPVertexAITranslatorV1ChatCompletion_RequestBody(t *testing.T)
 			onRetry:   false,
 			wantError: false,
 			wantHeaderMut: []internalapi.Header{
-				{":path", "publishers/google/models/gemini-1.5-pro:generateContent"},
-				{"content-length", "333"},
+				{":path", "publishers/google/models/gemini-3-pro:generateContent"},
+				{"content-length", "343"},
 			},
 			wantBody: wantBdyWithMediaResolutionFields,
 		},
@@ -800,7 +804,7 @@ func TestOpenAIToGCPVertexAITranslatorV1ChatCompletion_ResponseBody(t *testing.T
 		wantError         bool
 		wantHeaderMut     []internalapi.Header
 		wantBodyMut       []byte
-		wantTokenUsage    LLMTokenUsage
+		wantTokenUsage    metrics.TokenUsage
 	}{
 		{
 			name: "successful response",
@@ -859,12 +863,7 @@ func TestOpenAIToGCPVertexAITranslatorV1ChatCompletion_ResponseBody(t *testing.T
         "total_tokens": 25
     }
 }`),
-			wantTokenUsage: LLMTokenUsage{
-				InputTokens:       10,
-				OutputTokens:      15,
-				TotalTokens:       25,
-				CachedInputTokens: 10,
-			},
+			wantTokenUsage: tokenUsageFrom(10, 10, 15, 25),
 		},
 		{
 			name: "response with safety ratings",
@@ -944,11 +943,7 @@ func TestOpenAIToGCPVertexAITranslatorV1ChatCompletion_ResponseBody(t *testing.T
         "total_tokens": 20
     }
 }`),
-			wantTokenUsage: LLMTokenUsage{
-				InputTokens:  8,
-				OutputTokens: 12,
-				TotalTokens:  20,
-			},
+			wantTokenUsage: tokenUsageFrom(8, 0, 12, 20),
 		},
 		{
 			name: "empty response",
@@ -960,7 +955,7 @@ func TestOpenAIToGCPVertexAITranslatorV1ChatCompletion_ResponseBody(t *testing.T
 			wantError:      false,
 			wantHeaderMut:  []internalapi.Header{{contentLengthHeaderName, "28"}},
 			wantBodyMut:    []byte(`{"object":"chat.completion"}`),
-			wantTokenUsage: LLMTokenUsage{},
+			wantTokenUsage: tokenUsageFrom(-1, -1, -1, -1),
 		},
 		{
 			name: "single stream chunk response",
@@ -978,11 +973,7 @@ func TestOpenAIToGCPVertexAITranslatorV1ChatCompletion_ResponseBody(t *testing.T
 
 data: [DONE]
 `),
-			wantTokenUsage: LLMTokenUsage{
-				InputTokens:  5,
-				OutputTokens: 3,
-				TotalTokens:  8,
-			},
+			wantTokenUsage: tokenUsageFrom(5, 0, 3, 8),
 		},
 		{
 			name: "response with model version field",
@@ -1037,11 +1028,7 @@ data: [DONE]
         "total_tokens": 14
     }
 }`),
-			wantTokenUsage: LLMTokenUsage{
-				InputTokens:  6,
-				OutputTokens: 8,
-				TotalTokens:  14,
-			},
+			wantTokenUsage: tokenUsageFrom(6, 0, 8, 14),
 		},
 
 		{
@@ -1110,11 +1097,92 @@ data: [DONE]
         "total_tokens": 20
     }
 }`),
-			wantTokenUsage: LLMTokenUsage{
-				InputTokens:  8,
-				OutputTokens: 12,
-				TotalTokens:  20,
+			wantTokenUsage: tokenUsageFrom(8, 0, 12, 20),
+		},
+		{
+			name: "response with thought summary",
+			respHeaders: map[string]string{
+				"content-type": "application/json",
 			},
+			body: `{
+				"candidates": [
+					{
+						"content": {
+							"parts": [
+								{
+									"text": "Let me think step by step.",
+									"thought": true
+								},
+								{
+									"text": "AI Gateways act as intermediaries between clients and LLM services."
+								}
+							]
+						},
+						"finishReason": "STOP",
+						"safetyRatings": []
+					}
+				],
+				"promptFeedback": {
+					"safetyRatings": []
+				},
+				"usageMetadata": {
+					"promptTokenCount": 10,
+					"candidatesTokenCount": 15,
+					"totalTokenCount": 25,
+                    "cachedContentTokenCount": 10,
+                    "thoughtsTokenCount": 10
+				}
+			}`,
+			endOfStream:   true,
+			wantError:     false,
+			wantHeaderMut: []internalapi.Header{{contentLengthHeaderName, "450"}},
+			wantBodyMut: []byte(`{
+    "choices": [
+        {
+            "finish_reason": "stop",
+            "index": 0,
+            "message": {
+                "content": "AI Gateways act as intermediaries between clients and LLM services.",
+				"reasoning_content": {"reasoningContent": {"reasoningText": {"text":  "Let me think step by step."}}},
+                "role": "assistant"
+            }
+        }
+    ],
+    "object": "chat.completion",
+    "usage": {
+        "completion_tokens": 25,
+        "completion_tokens_details": {
+            "reasoning_tokens": 10
+        },
+        "prompt_tokens": 10,
+        "prompt_tokens_details": {
+            "cached_tokens": 10
+        },
+        "total_tokens": 25
+    }
+}`),
+
+			wantTokenUsage: tokenUsageFrom(10, 10, 15, 25),
+		},
+		{
+			name: "stream chunks with thought summary",
+			respHeaders: map[string]string{
+				"content-type": "application/json",
+			},
+			body: `data: {"candidates":[{"content":{"parts":[{"text":"let me think step by step and reply you.", "thought": true}]}}]}
+
+data: {"candidates":[{"content":{"parts":[{"text":"Hello"}]}}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3,"totalTokenCount":8}}`,
+			stream:        true,
+			endOfStream:   true,
+			wantError:     false,
+			wantHeaderMut: nil,
+			wantBodyMut: []byte(`data: {"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":{"text":"let me think step by step and reply you."}}}],"object":"chat.completion.chunk"}
+
+data: {"choices":[{"index":0,"delta":{"content":"Hello","role":"assistant"}}],"object":"chat.completion.chunk","usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8,"completion_tokens_details":{},"prompt_tokens_details":{}}}
+
+data: [DONE]
+`),
+			wantTokenUsage: tokenUsageFrom(5, 0, 3, 8),
 		},
 	}
 
@@ -1140,7 +1208,7 @@ data: [DONE]
 				t.Errorf("BodyMutation mismatch (-want +got):\n%s", diff)
 			}
 
-			if diff := cmp.Diff(tc.wantTokenUsage, tokenUsage); diff != "" {
+			if diff := cmp.Diff(tc.wantTokenUsage, tokenUsage, cmp.AllowUnexported(metrics.TokenUsage{})); diff != "" {
 				t.Errorf("TokenUsage mismatch (-want +got):\n%s", diff)
 			}
 		})
@@ -1233,7 +1301,7 @@ func TestOpenAIToGCPVertexAITranslatorV1ChatCompletion_StreamingResponseBody(t *
 			print(bodyStr)
 			require.Contains(t, bodyStr, "data: ")
 			require.Contains(t, bodyStr, "chat.completion.chunk")
-			require.Equal(t, LLMTokenUsage{}, tokenUsage) // No usage in this test chunk.
+			require.Equal(t, tokenUsageFrom(-1, -1, -1, -1), tokenUsage) // No usage in this test chunk.
 		})
 	}
 }
@@ -2252,6 +2320,10 @@ func TestResponseModel_GCPVertexAI(t *testing.T) {
 	_, _, tokenUsage, responseModel, err := translator.ResponseBody(nil, bytes.NewReader([]byte(vertexResponse)), true, nil)
 	require.NoError(t, err)
 	require.Equal(t, modelName, responseModel) // Returns the request model
-	require.Equal(t, uint32(10), tokenUsage.InputTokens)
-	require.Equal(t, uint32(5), tokenUsage.OutputTokens)
+	inputTokens, ok := tokenUsage.InputTokens()
+	require.True(t, ok)
+	require.Equal(t, uint32(10), inputTokens)
+	outputTokens, ok := tokenUsage.OutputTokens()
+	require.True(t, ok)
+	require.Equal(t, uint32(5), outputTokens)
 }

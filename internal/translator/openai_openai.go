@@ -13,11 +13,13 @@ import (
 	"io"
 	"path"
 	"strconv"
+	"strings"
 
 	"github.com/tidwall/sjson"
 
 	"github.com/envoyproxy/ai-gateway/internal/apischema/openai"
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
+	"github.com/envoyproxy/ai-gateway/internal/metrics"
 	tracing "github.com/envoyproxy/ai-gateway/internal/tracing/api"
 )
 
@@ -81,7 +83,7 @@ func (o *openAIToOpenAITranslatorV1ChatCompletion) ResponseError(respHeaders map
 	newHeaders []internalapi.Header, newBody []byte, err error,
 ) {
 	statusCode := respHeaders[statusHeaderName]
-	if v, ok := respHeaders[contentTypeHeaderName]; ok && v != jsonContentType {
+	if v, ok := respHeaders[contentTypeHeaderName]; ok && !strings.Contains(v, jsonContentType) {
 		var openaiError openai.Error
 		buf, err := io.ReadAll(body)
 		if err != nil {
@@ -117,7 +119,7 @@ func (o *openAIToOpenAITranslatorV1ChatCompletion) ResponseHeaders(map[string]st
 // so we return the actual model from the response body which may differ from the requested model
 // (e.g., request "gpt-4o" → response "gpt-4o-2024-08-06").
 func (o *openAIToOpenAITranslatorV1ChatCompletion) ResponseBody(_ map[string]string, body io.Reader, _ bool, span tracing.ChatCompletionSpan) (
-	newHeaders []internalapi.Header, newBody []byte, tokenUsage LLMTokenUsage, responseModel string, err error,
+	newHeaders []internalapi.Header, newBody []byte, tokenUsage metrics.TokenUsage, responseModel string, err error,
 ) {
 	if o.stream {
 		var buf []byte
@@ -135,13 +137,11 @@ func (o *openAIToOpenAITranslatorV1ChatCompletion) ResponseBody(_ map[string]str
 	if err := json.NewDecoder(body).Decode(&resp); err != nil {
 		return nil, nil, tokenUsage, responseModel, fmt.Errorf("failed to unmarshal body: %w", err)
 	}
-	tokenUsage = LLMTokenUsage{
-		InputTokens:  uint32(resp.Usage.PromptTokens),     //nolint:gosec
-		OutputTokens: uint32(resp.Usage.CompletionTokens), //nolint:gosec
-		TotalTokens:  uint32(resp.Usage.TotalTokens),      //nolint:gosec
-	}
+	tokenUsage.SetInputTokens(uint32(resp.Usage.PromptTokens))      //nolint:gosec
+	tokenUsage.SetOutputTokens(uint32(resp.Usage.CompletionTokens)) //nolint:gosec
+	tokenUsage.SetTotalTokens(uint32(resp.Usage.TotalTokens))       //nolint:gosec
 	if resp.Usage.PromptTokensDetails != nil {
-		tokenUsage.CachedInputTokens = uint32(resp.Usage.PromptTokensDetails.CachedTokens) //nolint:gosec
+		tokenUsage.SetCachedInputTokens(uint32(resp.Usage.PromptTokensDetails.CachedTokens)) //nolint:gosec
 	}
 	// Fallback to request model for test or non-compliant OpenAI backends
 	responseModel = cmp.Or(resp.Model, o.requestModel)
@@ -155,7 +155,7 @@ var dataPrefix = []byte("data: ")
 
 // extractUsageFromBufferEvent extracts the token usage from the buffered event.
 // It scans complete lines and returns the latest usage found in this batch.
-func (o *openAIToOpenAITranslatorV1ChatCompletion) extractUsageFromBufferEvent(span tracing.ChatCompletionSpan) (tokenUsage LLMTokenUsage) {
+func (o *openAIToOpenAITranslatorV1ChatCompletion) extractUsageFromBufferEvent(span tracing.ChatCompletionSpan) (tokenUsage metrics.TokenUsage) {
 	for {
 		i := bytes.IndexByte(o.buffered, '\n')
 		if i == -1 {
@@ -178,9 +178,9 @@ func (o *openAIToOpenAITranslatorV1ChatCompletion) extractUsageFromBufferEvent(s
 			o.streamingResponseModel = event.Model
 		}
 		if usage := event.Usage; usage != nil {
-			tokenUsage.InputTokens = uint32(usage.PromptTokens)      //nolint:gosec
-			tokenUsage.OutputTokens = uint32(usage.CompletionTokens) //nolint:gosec
-			tokenUsage.TotalTokens = uint32(usage.TotalTokens)       //nolint:gosec
+			tokenUsage.SetInputTokens(uint32(usage.PromptTokens))      //nolint:gosec
+			tokenUsage.SetOutputTokens(uint32(usage.CompletionTokens)) //nolint:gosec
+			tokenUsage.SetTotalTokens(uint32(usage.TotalTokens))       //nolint:gosec
 			// Do not mark buffering done; keep scanning to return the latest usage in this batch.
 		}
 	}

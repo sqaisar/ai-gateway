@@ -60,6 +60,7 @@ func TestMCPRouteController_syncMCPRouteSecurityPolicy(t *testing.T) {
 		wantSecPol     bool
 		wantJWT        bool
 		wantAPIKeyAuth *egv1a1.APIKeyAuth
+		wantExtAuth    *egv1a1.ExtAuth
 		wantBTP        bool
 		wantFilter     bool
 		wantJWKS       *egv1a1.RemoteJWKS
@@ -219,6 +220,114 @@ func TestMCPRouteController_syncMCPRouteSecurityPolicy(t *testing.T) {
 			wantJWKS:   nil,
 			wantErr:    false,
 		},
+		{
+			name: "ext auth configured",
+			mcpRoute: &aigv1a1.MCPRoute{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-route", Namespace: "default"},
+				Spec: aigv1a1.MCPRouteSpec{
+					SecurityPolicy: &aigv1a1.MCPRouteSecurityPolicy{
+						ExtAuth: &egv1a1.ExtAuth{
+							GRPC: &egv1a1.GRPCExtAuthService{
+								BackendCluster: egv1a1.BackendCluster{
+									BackendRefs: []egv1a1.BackendRef{
+										{
+											BackendObjectReference: gwapiv1.BackendObjectReference{
+												Name: "grpc-service",
+												Port: ptr.To(gwapiv1.PortNumber(1073)),
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			wantSecPol: true,
+			wantJWT:    false,
+			wantExtAuth: &egv1a1.ExtAuth{
+				GRPC: &egv1a1.GRPCExtAuthService{
+					BackendCluster: egv1a1.BackendCluster{
+						BackendRefs: []egv1a1.BackendRef{
+							{
+								BackendObjectReference: gwapiv1.BackendObjectReference{
+									Name: "grpc-service",
+									Port: ptr.To(gwapiv1.PortNumber(1073)),
+								},
+							},
+						},
+					},
+				},
+			},
+			wantBTP:    false,
+			wantFilter: false,
+			wantJWKS:   nil,
+			wantErr:    false,
+		},
+		{
+			name: "api key authentication and ext auth configured",
+			mcpRoute: &aigv1a1.MCPRoute{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-route", Namespace: "default"},
+				Spec: aigv1a1.MCPRouteSpec{
+					SecurityPolicy: &aigv1a1.MCPRouteSecurityPolicy{
+						APIKeyAuth: &egv1a1.APIKeyAuth{
+							CredentialRefs: []gwapiv1.SecretObjectReference{
+								{Name: "client-keys"},
+							},
+							ExtractFrom: []*egv1a1.ExtractFrom{
+								{Headers: []string{"x-api-key"}},
+							},
+							ForwardClientIDHeader: ptr.To("x-client-id"),
+							Sanitize:              ptr.To(true),
+						},
+						ExtAuth: &egv1a1.ExtAuth{
+							GRPC: &egv1a1.GRPCExtAuthService{
+								BackendCluster: egv1a1.BackendCluster{
+									BackendRefs: []egv1a1.BackendRef{
+										{
+											BackendObjectReference: gwapiv1.BackendObjectReference{
+												Name: "grpc-service",
+												Port: ptr.To(gwapiv1.PortNumber(1073)),
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			wantSecPol: true,
+			wantJWT:    false,
+			wantAPIKeyAuth: &egv1a1.APIKeyAuth{ // expected spec
+				CredentialRefs: []gwapiv1.SecretObjectReference{
+					{Name: "client-keys"},
+				},
+				ExtractFrom: []*egv1a1.ExtractFrom{
+					{Headers: []string{"x-api-key"}},
+				},
+				ForwardClientIDHeader: ptr.To("x-client-id"),
+				Sanitize:              ptr.To(true),
+			},
+			wantExtAuth: &egv1a1.ExtAuth{
+				GRPC: &egv1a1.GRPCExtAuthService{
+					BackendCluster: egv1a1.BackendCluster{
+						BackendRefs: []egv1a1.BackendRef{
+							{
+								BackendObjectReference: gwapiv1.BackendObjectReference{
+									Name: "grpc-service",
+									Port: ptr.To(gwapiv1.PortNumber(1073)),
+								},
+							},
+						},
+					},
+				},
+			},
+			wantBTP:    false,
+			wantFilter: false,
+			wantJWKS:   nil,
+			wantErr:    false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -264,6 +373,13 @@ func TestMCPRouteController_syncMCPRouteSecurityPolicy(t *testing.T) {
 					require.Equal(t, tt.wantAPIKeyAuth, securityPolicy.Spec.APIKeyAuth)
 				} else {
 					require.Nil(t, securityPolicy.Spec.APIKeyAuth)
+				}
+
+				if tt.wantExtAuth != nil {
+					require.NotNil(t, securityPolicy.Spec.ExtAuth)
+					require.Equal(t, tt.wantExtAuth, securityPolicy.Spec.ExtAuth)
+				} else {
+					require.Nil(t, securityPolicy.Spec.ExtAuth)
 				}
 
 				// The SecurityPolicy should only apply to the HTTPRoute MCP proxy rule.
@@ -480,7 +596,7 @@ func Test_buildWWWAuthenticateHeaderValue(t *testing.T) {
 			metadata: &aigv1a1.ProtectedResourceMetadata{
 				Resource: "https://api.example.com/mcp/v1",
 			},
-			expected: `Bearer error="invalid_request", error_description="No access token was provided in this request", resource_metadata="https://api.example.com/.well-known/oauth-protected-resource"`,
+			expected: `Bearer error="invalid_request", error_description="No access token was provided in this request", resource_metadata="https://api.example.com/.well-known/oauth-protected-resource/mcp/v1"`,
 		},
 		{
 			name: "https URL without path",
@@ -494,14 +610,14 @@ func Test_buildWWWAuthenticateHeaderValue(t *testing.T) {
 			metadata: &aigv1a1.ProtectedResourceMetadata{
 				Resource: "https://api.example.com/mcp/",
 			},
-			expected: `Bearer error="invalid_request", error_description="No access token was provided in this request", resource_metadata="https://api.example.com/.well-known/oauth-protected-resource"`,
+			expected: `Bearer error="invalid_request", error_description="No access token was provided in this request", resource_metadata="https://api.example.com/.well-known/oauth-protected-resource/mcp"`,
 		},
 		{
 			name: "http URL with path",
 			metadata: &aigv1a1.ProtectedResourceMetadata{
 				Resource: "http://api.example.com/mcp/v1",
 			},
-			expected: `Bearer error="invalid_request", error_description="No access token was provided in this request", resource_metadata="http://api.example.com/.well-known/oauth-protected-resource"`,
+			expected: `Bearer error="invalid_request", error_description="No access token was provided in this request", resource_metadata="http://api.example.com/.well-known/oauth-protected-resource/mcp/v1"`,
 		},
 		{
 			name: "http URL without path",
@@ -515,28 +631,52 @@ func Test_buildWWWAuthenticateHeaderValue(t *testing.T) {
 			metadata: &aigv1a1.ProtectedResourceMetadata{
 				Resource: "http://api.example.com/mcp/",
 			},
-			expected: `Bearer error="invalid_request", error_description="No access token was provided in this request", resource_metadata="http://api.example.com/.well-known/oauth-protected-resource"`,
+			expected: `Bearer error="invalid_request", error_description="No access token was provided in this request", resource_metadata="http://api.example.com/.well-known/oauth-protected-resource/mcp"`,
 		},
 		{
 			name: "URL with port number https",
 			metadata: &aigv1a1.ProtectedResourceMetadata{
 				Resource: "https://api.example.com:8080/mcp",
 			},
-			expected: `Bearer error="invalid_request", error_description="No access token was provided in this request", resource_metadata="https://api.example.com:8080/.well-known/oauth-protected-resource"`,
+			expected: `Bearer error="invalid_request", error_description="No access token was provided in this request", resource_metadata="https://api.example.com:8080/.well-known/oauth-protected-resource/mcp"`,
 		},
 		{
 			name: "URL with port number http",
 			metadata: &aigv1a1.ProtectedResourceMetadata{
 				Resource: "http://api.example.com:8080/mcp",
 			},
-			expected: `Bearer error="invalid_request", error_description="No access token was provided in this request", resource_metadata="http://api.example.com:8080/.well-known/oauth-protected-resource"`,
+			expected: `Bearer error="invalid_request", error_description="No access token was provided in this request", resource_metadata="http://api.example.com:8080/.well-known/oauth-protected-resource/mcp"`,
 		},
 		{
 			name: "complex path with multiple segments",
 			metadata: &aigv1a1.ProtectedResourceMetadata{
 				Resource: "https://api.example.com/v1/mcp/endpoint",
 			},
-			expected: `Bearer error="invalid_request", error_description="No access token was provided in this request", resource_metadata="https://api.example.com/.well-known/oauth-protected-resource"`,
+			expected: `Bearer error="invalid_request", error_description="No access token was provided in this request", resource_metadata="https://api.example.com/.well-known/oauth-protected-resource/v1/mcp/endpoint"`,
+		},
+		{
+			name: "with empty scopes supported",
+			metadata: &aigv1a1.ProtectedResourceMetadata{
+				Resource:        "https://api.example.com/mcp",
+				ScopesSupported: []string{},
+			},
+			expected: `Bearer error="invalid_request", error_description="No access token was provided in this request", resource_metadata="https://api.example.com/.well-known/oauth-protected-resource/mcp"`,
+		},
+		{
+			name: "with single scope supported",
+			metadata: &aigv1a1.ProtectedResourceMetadata{
+				Resource:        "https://api.example.com/mcp",
+				ScopesSupported: []string{"read"},
+			},
+			expected: `Bearer error="invalid_request", error_description="No access token was provided in this request", resource_metadata="https://api.example.com/.well-known/oauth-protected-resource/mcp", scope="read"`,
+		},
+		{
+			name: "with multiple scopes supported",
+			metadata: &aigv1a1.ProtectedResourceMetadata{
+				Resource:        "https://api.example.com/mcp",
+				ScopesSupported: []string{"read", "write"},
+			},
+			expected: `Bearer error="invalid_request", error_description="No access token was provided in this request", resource_metadata="https://api.example.com/.well-known/oauth-protected-resource/mcp", scope="read write"`,
 		},
 	}
 
@@ -581,6 +721,20 @@ func Test_fetchOAuthServerMetadata(t *testing.T) {
 			name:           "well-known after issuer",
 			issuerPath:     "/some/path",
 			authSeverURL:   "/.well-known/oauth-authorization-server/some/path",
+			forcedFailures: 0,
+			wantStatusCode: http.StatusOK,
+		},
+		{
+			name:           "oidc well-known at the end",
+			issuerPath:     "/some/path",
+			authSeverURL:   "/some/path/.well-known/openid-configuration",
+			forcedFailures: 0,
+			wantStatusCode: http.StatusOK,
+		},
+		{
+			name:           "oidc well-known after issuer",
+			issuerPath:     "/some/path",
+			authSeverURL:   "/.well-known/openid-configuration/some/path",
 			forcedFailures: 0,
 			wantStatusCode: http.StatusOK,
 		},

@@ -6,98 +6,86 @@
 package tracing
 
 import (
+	openaisdk "github.com/openai/openai-go/v2"
 	"go.opentelemetry.io/otel/trace"
 
+	cohereschema "github.com/envoyproxy/ai-gateway/internal/apischema/cohere"
 	"github.com/envoyproxy/ai-gateway/internal/apischema/openai"
 	tracing "github.com/envoyproxy/ai-gateway/internal/tracing/api"
 )
 
-// Ensure chatCompletionSpan implements ChatCompletionSpan.
-var _ tracing.ChatCompletionSpan = (*chatCompletionSpan)(nil)
+type responseRecorder[RespT any] interface {
+	RecordResponse(trace.Span, *RespT)
+	RecordResponseOnError(trace.Span, int, []byte)
+}
 
-type chatCompletionSpan struct {
+type streamResponseRecorder[RespT, ChunkT any] interface {
+	responseRecorder[RespT]
+	RecordResponseChunks(trace.Span, []*ChunkT)
+}
+
+type noopChunkRecorder[ChunkT any] struct{}
+
+func (noopChunkRecorder[ChunkT]) RecordResponseChunk(*ChunkT) {}
+
+type streamingSpan[RespT, ChunkT any] struct {
 	span     trace.Span
-	recorder tracing.ChatCompletionRecorder
-	chunks   []*openai.ChatCompletionResponseChunk
+	recorder streamResponseRecorder[RespT, ChunkT]
+	chunks   []*ChunkT
 }
 
-// RecordResponseChunk invokes [tracing.ChatCompletionRecorder.RecordResponseChunk].
-func (s *chatCompletionSpan) RecordResponseChunk(resp *openai.ChatCompletionResponseChunk) {
-	s.chunks = append(s.chunks, resp) // Delay recording until EndSpan to collect all events.
+func (s *streamingSpan[RespT, ChunkT]) RecordResponseChunk(resp *ChunkT) {
+	s.chunks = append(s.chunks, resp)
 }
 
-// RecordResponse invokes [tracing.ChatCompletionRecorder.RecordResponse].
-func (s *chatCompletionSpan) RecordResponse(resp *openai.ChatCompletionResponse) {
+func (s *streamingSpan[RespT, ChunkT]) RecordResponse(resp *RespT) {
 	s.recorder.RecordResponse(s.span, resp)
 }
 
-// EndSpan invokes [tracing.ChatCompletionRecorder.RecordResponse].
-func (s *chatCompletionSpan) EndSpan() {
+func (s *streamingSpan[RespT, ChunkT]) EndSpan() {
 	if len(s.chunks) > 0 {
 		s.recorder.RecordResponseChunks(s.span, s.chunks)
 	}
 	s.span.End()
 }
 
-// EndSpanOnError invokes [tracing.ChatCompletionRecorder.RecordResponse].
-func (s *chatCompletionSpan) EndSpanOnError(statusCode int, body []byte) {
+func (s *streamingSpan[RespT, ChunkT]) EndSpanOnError(statusCode int, body []byte) {
 	s.recorder.RecordResponseOnError(s.span, statusCode, body)
 	s.span.End()
 }
 
-// Ensure embeddingsSpan implements EmbeddingsSpan.
-var _ tracing.EmbeddingsSpan = (*embeddingsSpan)(nil)
-
-type embeddingsSpan struct {
+type responseSpan[RespT, ChunkT any] struct {
+	noopChunkRecorder[ChunkT]
 	span     trace.Span
-	recorder tracing.EmbeddingsRecorder
+	recorder streamResponseRecorder[RespT, ChunkT]
 }
 
-// RecordResponse invokes [tracing.EmbeddingsRecorder.RecordResponse].
-func (s *embeddingsSpan) RecordResponse(resp *openai.EmbeddingResponse) {
+func (s *responseSpan[RespT, ChunkT]) RecordResponse(resp *RespT) {
 	s.recorder.RecordResponse(s.span, resp)
 }
 
-// EndSpan finalizes and ends the span.
-func (s *embeddingsSpan) EndSpan() {
+func (s *responseSpan[RespT, ChunkT]) EndSpan() {
 	s.span.End()
 }
 
-// EndSpanOnError invokes [tracing.EmbeddingsRecorder.RecordResponseOnError].
-func (s *embeddingsSpan) EndSpanOnError(statusCode int, body []byte) {
+func (s *responseSpan[RespT, ChunkT]) EndSpanOnError(statusCode int, body []byte) {
 	s.recorder.RecordResponseOnError(s.span, statusCode, body)
 	s.span.End()
 }
 
-// Ensure completionSpan implements CompletionSpan.
-var _ tracing.CompletionSpan = (*completionSpan)(nil)
+// Type aliases tying generic implementations to concrete recorder contracts.
+type (
+	chatCompletionSpan  = streamingSpan[openai.ChatCompletionResponse, openai.ChatCompletionResponseChunk]
+	completionSpan      = streamingSpan[openai.CompletionResponse, openai.CompletionResponse]
+	embeddingsSpan      = responseSpan[openai.EmbeddingResponse, struct{}]
+	imageGenerationSpan = responseSpan[openaisdk.ImagesResponse, struct{}]
+	rerankSpan          = responseSpan[cohereschema.RerankV2Response, struct{}]
+)
 
-type completionSpan struct {
-	span     trace.Span
-	recorder tracing.CompletionRecorder
-	chunks   []*openai.CompletionResponse
-}
-
-// RecordResponseChunk invokes [tracing.CompletionRecorder.RecordResponseChunk].
-func (s *completionSpan) RecordResponseChunk(resp *openai.CompletionResponse) {
-	s.chunks = append(s.chunks, resp) // Delay recording until EndSpan to collect all events.
-}
-
-// RecordResponse invokes [tracing.CompletionRecorder.RecordResponse].
-func (s *completionSpan) RecordResponse(resp *openai.CompletionResponse) {
-	s.recorder.RecordResponse(s.span, resp)
-}
-
-// EndSpan invokes [tracing.CompletionRecorder.RecordResponseChunks].
-func (s *completionSpan) EndSpan() {
-	if len(s.chunks) > 0 {
-		s.recorder.RecordResponseChunks(s.span, s.chunks)
-	}
-	s.span.End()
-}
-
-// EndSpanOnError invokes [tracing.CompletionRecorder.RecordResponseOnError].
-func (s *completionSpan) EndSpanOnError(statusCode int, body []byte) {
-	s.recorder.RecordResponseOnError(s.span, statusCode, body)
-	s.span.End()
-}
+var (
+	_ tracing.ChatCompletionSpan  = (*chatCompletionSpan)(nil)
+	_ tracing.CompletionSpan      = (*completionSpan)(nil)
+	_ tracing.EmbeddingsSpan      = (*embeddingsSpan)(nil)
+	_ tracing.ImageGenerationSpan = (*imageGenerationSpan)(nil)
+	_ tracing.RerankSpan          = (*rerankSpan)(nil)
+)

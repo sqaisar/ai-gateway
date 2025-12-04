@@ -25,6 +25,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health/grpc_health_v1"
 
+	"github.com/envoyproxy/ai-gateway/internal/endpointspec"
 	"github.com/envoyproxy/ai-gateway/internal/extproc"
 	"github.com/envoyproxy/ai-gateway/internal/filterapi"
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
@@ -36,16 +37,18 @@ import (
 
 // extProcFlags is the struct that holds the flags passed to the external processor.
 type extProcFlags struct {
-	configPath                     string        // path to the configuration file.
-	extProcAddr                    string        // gRPC address for the external processor.
-	logLevel                       slog.Level    // log level for the external processor.
-	adminPort                      int           // HTTP port for the admin server (metrics and health).
-	metricsRequestHeaderAttributes string        // comma-separated key-value pairs for mapping HTTP request headers to otel metric attributes.
-	metricsRequestHeaderLabels     string        // DEPRECATED: use metricsRequestHeaderAttributes instead.
-	spanRequestHeaderAttributes    string        // comma-separated key-value pairs for mapping HTTP request headers to otel span attributes.
-	mcpAddr                        string        // address for the MCP proxy server which can be either tcp or unix domain socket.
-	mcpSessionEncryptionSeed       string        // Seed for deriving the key for encrypting MCP sessions.
-	mcpWriteTimeout                time.Duration // the maximum duration before timing out writes of the MCP response.
+	configPath                             string        // path to the configuration file.
+	extProcAddr                            string        // gRPC address for the external processor.
+	logLevel                               slog.Level    // log level for the external processor.
+	adminPort                              int           // HTTP port for the admin server (metrics and health).
+	metricsRequestHeaderAttributes         string        // comma-separated key-value pairs for mapping HTTP request headers to otel metric attributes.
+	spanRequestHeaderAttributes            string        // comma-separated key-value pairs for mapping HTTP request headers to otel span attributes.
+	mcpAddr                                string        // address for the MCP proxy server which can be either tcp or unix domain socket.
+	mcpSessionEncryptionSeed               string        // Seed for deriving the key for encrypting MCP sessions.
+	mcpSessionEncryptionIterations         int           // Number of iterations to use for PBKDF2 key derivation for MCP session encryption.
+	mcpFallbackSessionEncryptionSeed       string        // Fallback seed for deriving the key for encrypting MCP sessions.
+	mcpFallbackSessionEncryptionIterations int           // Number of iterations to use for PBKDF2 key derivation for fallback MCP session encryption.
+	mcpWriteTimeout                        time.Duration // the maximum duration before timing out writes of the MCP response.
 	// rootPrefix is the root prefix for all the processors.
 	rootPrefix string
 	// maxRecvMsgSize is the maximum message size in bytes that the gRPC server can receive.
@@ -84,11 +87,6 @@ func parseAndValidateFlags(args []string) (extProcFlags, error) {
 		"",
 		"Comma-separated key-value pairs for mapping HTTP request headers to otel metric attributes. Format: x-team-id:team.id,x-user-id:user.id.",
 	)
-	fs.StringVar(&flags.metricsRequestHeaderLabels,
-		"metricsRequestHeaderLabels",
-		"",
-		"DEPRECATED: Use -metricsRequestHeaderAttributes instead. This flag will be removed in a future release.",
-	)
 	fs.StringVar(&flags.spanRequestHeaderAttributes,
 		"spanRequestHeaderAttributes",
 		"",
@@ -110,23 +108,19 @@ func parseAndValidateFlags(args []string) (extProcFlags, error) {
 		"Maximum message size in bytes that the gRPC server can receive. Default is 4MB.",
 	)
 	fs.StringVar(&flags.mcpAddr, "mcpAddr", "", "the address (TCP or UDS) for the MCP proxy server, such as :1063 or unix:///tmp/ext_proc.sock. Optional.")
-	fs.StringVar(&flags.mcpSessionEncryptionSeed,
-		"mcpSessionEncryptionSeed",
-		"mcp",
-		"Arbitrary string seed used to derive the MCP session encryption key. "+
-			"Do not include commas as they are used as separators. You can optionally pass \"fallback\" seed after the first one to allow for key rotation. "+
-			"For example: \"new-seed,old-seed-for-fallback\". The fallback seed is only used for decryption.",
-	)
+	fs.StringVar(&flags.mcpSessionEncryptionSeed, "mcpSessionEncryptionSeed", "default-insecure-seed",
+		"Seed used to derive the MCP session encryption key. This should be changed and set to a secure value.")
+	fs.IntVar(&flags.mcpSessionEncryptionIterations, "mcpSessionEncryptionIterations", 100_000,
+		"Number of iterations to use for PBKDF2 key derivation for MCP session encryption.")
+	fs.StringVar(&flags.mcpFallbackSessionEncryptionSeed, "mcpFallbackSessionEncryptionSeed", "",
+		"Optional fallback seed used for MCP session key rotation.")
+	fs.IntVar(&flags.mcpFallbackSessionEncryptionIterations, "mcpFallbackSessionEncryptionIterations", 100_000,
+		"Number of iterations used in the fallback PBKDF2 key derivation for MCP session encryption.")
 	fs.DurationVar(&flags.mcpWriteTimeout, "mcpWriteTimeout", 120*time.Second,
 		"The maximum duration before timing out writes of the MCP response")
 
 	if err := fs.Parse(args); err != nil {
 		return extProcFlags{}, fmt.Errorf("failed to parse extProcFlags: %w", err)
-	}
-
-	// Handle deprecated flag: fall back to metricsRequestHeaderLabels if metricsRequestHeaderAttributes is not set.
-	if flags.metricsRequestHeaderAttributes == "" && flags.metricsRequestHeaderLabels != "" {
-		flags.metricsRequestHeaderAttributes = flags.metricsRequestHeaderLabels
 	}
 
 	if flags.configPath == "" {
@@ -171,11 +165,6 @@ func Main(ctx context.Context, args []string, stderr io.Writer) (err error) {
 	}
 
 	l := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: flags.logLevel}))
-
-	// Warn if deprecated flag is being used.
-	if flags.metricsRequestHeaderLabels != "" {
-		l.Warn("The -metricsRequestHeaderLabels flag is deprecated and will be removed in a future release. Please use -metricsRequestHeaderAttributes instead.")
-	}
 
 	l.Info("starting external processor",
 		slog.String("version", version.Parse()),
@@ -235,8 +224,6 @@ func Main(ctx context.Context, args []string, stderr io.Writer) (err error) {
 	if err != nil {
 		return fmt.Errorf("failed to parse endpoint prefixes: %w", err)
 	}
-	// Set defaults for any missing endpoint prefixes.
-	endpointPrefixes.SetDefaults()
 
 	// Create Prometheus registry and reader which automatically converts
 	// attribute to Prometheus-compatible format (e.g. dots to underscores).
@@ -247,16 +234,16 @@ func Main(ctx context.Context, args []string, stderr io.Writer) (err error) {
 	}
 
 	// Create meter with Prometheus + optionally OTEL.
-	meter, metricsShutdown, err := metrics.NewMetricsFromEnv(ctx, os.Stdout, promReader)
+	meter, metricsShutdown, err := metrics.NewMeterFromEnv(ctx, os.Stdout, promReader)
 	if err != nil {
 		return fmt.Errorf("failed to create metrics: %w", err)
 	}
-	chatCompletionMetrics := metrics.NewChatCompletionFactory(meter, metricsRequestHeaderAttributes)
-	messagesMetrics := metrics.NewMessagesFactory(meter, metricsRequestHeaderAttributes)
-	completionMetrics := metrics.NewCompletionFactory(meter, metricsRequestHeaderAttributes)
-	embeddingsMetrics := metrics.NewEmbeddingsFactory(meter, metricsRequestHeaderAttributes)
-	imageGenerationMetrics := metrics.NewImageGenerationFactory(meter, metricsRequestHeaderAttributes)()
-	rerankMetrics := metrics.NewRerankFactory(meter, metricsRequestHeaderAttributes)
+	chatCompletionMetricsFactory := metrics.NewMetricsFactory(meter, metricsRequestHeaderAttributes, metrics.GenAIOperationChat)
+	messagesMetricsFactory := metrics.NewMetricsFactory(meter, metricsRequestHeaderAttributes, metrics.GenAIOperationMessages)
+	completionMetricsFactory := metrics.NewMetricsFactory(meter, metricsRequestHeaderAttributes, metrics.GenAIOperationCompletion)
+	embeddingsMetricsFactory := metrics.NewMetricsFactory(meter, metricsRequestHeaderAttributes, metrics.GenAIOperationEmbedding)
+	imageGenerationMetricsFactory := metrics.NewMetricsFactory(meter, metricsRequestHeaderAttributes, metrics.GenAIOperationImageGeneration)
+	rerankMetricsFactory := metrics.NewMetricsFactory(meter, metricsRequestHeaderAttributes, metrics.GenAIOperationRerank)
 	mcpMetrics := metrics.NewMCP(meter, metricsRequestHeaderAttributes)
 
 	tracing, err := tracing.NewTracingFromEnv(ctx, os.Stdout, spanRequestHeaderAttributes)
@@ -264,17 +251,23 @@ func Main(ctx context.Context, args []string, stderr io.Writer) (err error) {
 		return err
 	}
 
-	server, err := extproc.NewServer(l, tracing)
+	server, err := extproc.NewServer(l)
 	if err != nil {
 		return fmt.Errorf("failed to create external processor server: %w", err)
 	}
-	server.Register(path.Join(flags.rootPrefix, *endpointPrefixes.OpenAI, "/v1/chat/completions"), extproc.ChatCompletionProcessorFactory(chatCompletionMetrics))
-	server.Register(path.Join(flags.rootPrefix, *endpointPrefixes.OpenAI, "/v1/completions"), extproc.CompletionsProcessorFactory(completionMetrics))
-	server.Register(path.Join(flags.rootPrefix, *endpointPrefixes.OpenAI, "/v1/embeddings"), extproc.EmbeddingsProcessorFactory(embeddingsMetrics))
-	server.Register(path.Join(flags.rootPrefix, *endpointPrefixes.OpenAI, "/v1/images/generations"), extproc.ImageGenerationProcessorFactory(imageGenerationMetrics))
-	server.Register(path.Join(flags.rootPrefix, *endpointPrefixes.Cohere, "/v2/rerank"), extproc.RerankProcessorFactory(rerankMetrics))
-	server.Register(path.Join(flags.rootPrefix, *endpointPrefixes.OpenAI, "/v1/models"), extproc.NewModelsProcessor)
-	server.Register(path.Join(flags.rootPrefix, *endpointPrefixes.Anthropic, "/v1/messages"), extproc.MessagesProcessorFactory(messagesMetrics))
+	server.Register(path.Join(flags.rootPrefix, endpointPrefixes.OpenAI, "/v1/chat/completions"), extproc.NewFactory(
+		chatCompletionMetricsFactory, tracing.ChatCompletionTracer(), endpointspec.ChatCompletionsEndpointSpec{}))
+	server.Register(path.Join(flags.rootPrefix, endpointPrefixes.OpenAI, "/v1/completions"), extproc.NewFactory(
+		completionMetricsFactory, tracing.CompletionTracer(), endpointspec.CompletionsEndpointSpec{}))
+	server.Register(path.Join(flags.rootPrefix, endpointPrefixes.OpenAI, "/v1/embeddings"), extproc.NewFactory(
+		embeddingsMetricsFactory, tracing.EmbeddingsTracer(), endpointspec.EmbeddingsEndpointSpec{}))
+	server.Register(path.Join(flags.rootPrefix, endpointPrefixes.OpenAI, "/v1/images/generations"), extproc.NewFactory(
+		imageGenerationMetricsFactory, tracing.ImageGenerationTracer(), endpointspec.ImageGenerationEndpointSpec{}))
+	server.Register(path.Join(flags.rootPrefix, endpointPrefixes.Cohere, "/v2/rerank"), extproc.NewFactory(
+		rerankMetricsFactory, tracing.RerankTracer(), endpointspec.RerankEndpointSpec{}))
+	server.Register(path.Join(flags.rootPrefix, endpointPrefixes.OpenAI, "/v1/models"), extproc.NewModelsProcessor)
+	server.Register(path.Join(flags.rootPrefix, endpointPrefixes.Anthropic, "/v1/messages"), extproc.NewFactory(
+		messagesMetricsFactory, tracing.MessageTracer(), endpointspec.MessagesEndpointSpec{}))
 
 	if watchErr := filterapi.StartConfigWatcher(ctx, flags.configPath, server, l, time.Second*5); watchErr != nil {
 		return fmt.Errorf("failed to start config watcher: %w", watchErr)
@@ -287,8 +280,17 @@ func Main(ctx context.Context, args []string, stderr io.Writer) (err error) {
 
 	var mcpServer *http.Server
 	if mcpLis != nil {
-		seed, fallbackSeed, _ := strings.Cut(flags.mcpSessionEncryptionSeed, ",")
-		mcpSessionCrypto := mcpproxy.DefaultSessionCrypto(seed, fallbackSeed)
+		mcpSessionCrypto := mcpproxy.NewPBKDF2AesGcmSessionCrypto(flags.mcpSessionEncryptionSeed, flags.mcpSessionEncryptionIterations)
+		if flags.mcpFallbackSessionEncryptionSeed != "" {
+			mcpSessionCrypto = &mcpproxy.FallbackEnabledSessionCrypto{
+				Primary: mcpSessionCrypto,
+				Fallback: mcpproxy.NewPBKDF2AesGcmSessionCrypto(
+					flags.mcpFallbackSessionEncryptionSeed,
+					flags.mcpFallbackSessionEncryptionIterations,
+				),
+			}
+		}
+
 		var mcpProxyMux *http.ServeMux
 		var mcpProxyConfig *mcpproxy.ProxyConfig
 		mcpProxyConfig, mcpProxyMux, err = mcpproxy.NewMCPProxy(l.With("component", "mcp-proxy"), mcpMetrics,
